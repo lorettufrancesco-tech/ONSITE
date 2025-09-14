@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Web GPS Tracker Completo by Francesco Lorettu</title>
+<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js"></script>
+<style>
+body { font-family: 'Orbitron', sans-serif; background-color: #1e1e1e; color: #eaeaea; }
+.camouflage { background-color: #2e2e2e; }
+.led { width: 15px; height: 15px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+.led-green { background: green; }
+.led-red { background: red; }
+#modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 9999; }
+#modal .content { background: #3b3c36; border: 2px solid #6b8e23; border-radius: 12px; padding: 20px; max-width: 400px; text-align: center; color: #fff; }
+#map { height: 300px; border-radius: 12px; margin-top: 10px; }
+#compass { width: 100px; height: 100px; border: 2px solid #6b8e23; border-radius: 50%; margin-top:10px; position: relative; }
+#compassArrow { width: 4px; height: 40px; background: red; position: absolute; top: 10px; left: 48px; transform-origin: bottom center; }
+</style>
+</head>
+<body class="camouflage min-h-screen flex flex-col p-4">
+
+<div id="modal">
+  <div class="content">
+    <h2 class="text-xl font-bold mb-4">Autorizzazioni necessarie</h2>
+    <p class="mb-3 text-sm">Per funzionare correttamente, l'app ha bisogno di:<br>• Accesso alla posizione GPS<br>• Accesso ai sensori di orientamento<br>• Permesso di salvare file localmente (KML, KMZ, GPX)</p>
+    <button id="grantBtn" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg">Concedi autorizzazioni</button>
+    <p id="modalError" class="text-red-400 text-sm mt-2 hidden"></p>
+  </div>
+</div>
+
+<div class="space-y-4">
+  <div class="flex items-center space-x-2">
+    <span id="statusLed" class="led led-red"></span>
+    <span id="statusText">FERMO</span>
+  </div>
+  <div class="flex space-x-4">
+    <button id="startBtn" class="bg-green-700 text-white px-6 py-3 rounded-xl font-bold">Avvia</button>
+    <button id="stopBtn" class="bg-red-700 text-white px-6 py-3 rounded-xl font-bold" disabled>Ferma</button>
+    <button id="noteBtn" class="bg-yellow-600 text-white px-6 py-3 rounded-xl font-bold">Aggiungi Nota</button>
+  </div>
+  <div id="coordsDisplay" class="bg-gray-800 p-2 rounded text-sm">Lat: --, Lon: --</div>
+  <div id="distanceDisplay" class="bg-gray-800 p-2 rounded text-sm">Distanza: 0 m | Dislivello: 0 m</div>
+  <div id="map"></div>
+  <div id="compass"><div id="compassArrow"></div></div>
+  <canvas id="elevationChart" height="100"></canvas>
+  <div class="flex space-x-2">
+    <button id="exportKML" class="bg-blue-600 text-white px-4 py-2 rounded-lg">Esporta KML</button>
+    <button id="exportKMZ" class="bg-blue-800 text-white px-4 py-2 rounded-lg">Esporta KMZ</button>
+    <button id="exportGPX" class="bg-indigo-600 text-white px-4 py-2 rounded-lg">Esporta GPX</button>
+  </div>
+</div>
+
+<script>
+let state = { watchId:null, map:null, points:[], notes:[], marker:null, polyline:null, chart:null };
+
+function initMap(){
+  state.map = L.map('map').setView([0,0],2);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(state.map);
+  let ctx = document.getElementById('elevationChart').getContext('2d');
+  state.chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{label: 'Elevazione (m)', data: [], borderColor: 'lime', fill: false}] },
+    options: { responsive:true, scales: { y:{ beginAtZero:true } } }
+  });
+}
+
+function updateStats(){
+  let distance=0, elevation=0;
+  for(let i=1;i<state.points.length;i++){
+    let p1=state.points[i-1], p2=state.points[i];
+    let dx=(p2.lat-p1.lat)*111139;
+    let dy=(p2.lon-p1.lon)*111139*Math.cos(p1.lat*Math.PI/180);
+    distance += Math.sqrt(dx*dx + dy*dy);
+    elevation += (p2.ele-p1.ele);
+  }
+  document.getElementById('distanceDisplay').textContent = `Distanza: ${distance.toFixed(1)} m | Dislivello: ${elevation.toFixed(1)} m`;
+  state.chart.data.labels = state.points.map((_,i)=>i);
+  state.chart.data.datasets[0].data = state.points.map(p=>p.ele);
+  state.chart.update();
+}
+
+function startTracking(){
+  if(!navigator.geolocation){ alert("GPS non supportato"); return; }
+  state.watchId = navigator.geolocation.watchPosition(pos=>{
+    const {latitude, longitude, altitude, heading} = pos.coords;
+    state.points.push({lat:latitude, lon:longitude, ele:altitude||0});
+    document.getElementById('coordsDisplay').textContent = `Lat: ${latitude.toFixed(6)}, Lon: ${longitude.toFixed(6)}`;
+    if(!state.marker){ state.marker=L.marker([latitude,longitude]).addTo(state.map); state.map.setView([latitude,longitude],15);}
+    else { state.marker.setLatLng([latitude,longitude]); }
+    if(state.polyline){ state.map.removeLayer(state.polyline); }
+    state.polyline = L.polyline(state.points.map(p=>[p.lat,p.lon]),{color:'red'}).addTo(state.map);
+    updateCompass(heading||null);
+    updateStats();
+  }, err=>{ alert("Errore GPS: "+err.message); }, {enableHighAccuracy:true, maximumAge:0, timeout:5000});
+  document.getElementById('statusLed').className='led led-green';
+  document.getElementById('statusText').textContent='TRACCIAMENTO';
+  document.getElementById('startBtn').disabled=true;
+  document.getElementById('stopBtn').disabled=false;
+}
+
+function stopTracking(){
+  if(state.watchId){ navigator.geolocation.clearWatch(state.watchId); state.watchId=null; }
+  document.getElementById('statusLed').className='led led-red';
+  document.getElementById('statusText').textContent='FERMO';
+  document.getElementById('startBtn').disabled=false;
+  document.getElementById('stopBtn').disabled=true;
+}
+
+function addNote(){
+  if(state.points.length===0){ alert("Avvia il tracking prima di aggiungere note."); return; }
+  let note=prompt("Inserisci nota:");
+  if(note){ state.notes.push({lat:state.points[state.points.length-1].lat, lon:state.points[state.points.length-1].lon, text:note}); }
+}
+
+function updateCompass(heading){
+  let arrow=document.getElementById('compassArrow');
+  if(heading!==null){ arrow.style.transform=`rotate(${heading}deg)`; }
+}
+
+// KML con linea rossa
+function generateKML(){
+  let kml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>Percorso</name>
+  <Style id="redLine">
+    <LineStyle>
+      <color>ff0000ff</color>
+      <width>4</width>
+    </LineStyle>
+  </Style>
+  <Placemark>
+    <name>Percorso</name>
+    <styleUrl>#redLine</styleUrl>
+    <LineString>
+      <coordinates>`;
+  kml += state.points.map(p => `${p.lon},${p.lat},${p.ele}`).join(' ');
+  kml += `</coordinates>
+    </LineString>
+  </Placemark>`;
+  state.notes.forEach(n => {
+    kml += `<Placemark>
+      <name>Nota</name>
+      <description>${n.text}</description>
+      <Point><coordinates>${n.lon},${n.lat},0</coordinates></Point>
+    </Placemark>`;
+  });
+  kml += `</Document></kml>`;
+  return kml;
+}
+
+function exportKML(){
+  if(state.points.length===0){ alert("Nessun punto da esportare."); return; }
+  let kml = generateKML();
+  let blob = new Blob([kml], {type:'application/vnd.google-earth.kml+xml'});
+  let a = document.createElement('a'); 
+  a.href = URL.createObjectURL(blob); 
+  a.download = 'percorso.kml'; 
+  a.click();
+  alert(`File KML generato: ${state.points.length} punti, ${blob.size} byte`);
+}
+
+function exportKMZ(){
+  if(state.points.length===0){ alert("Nessun punto da esportare."); return; }
+  let zip = new JSZip
+zip.file('percorso.kml', generateKML());
+  zip.generateAsync({type:'blob'}).then(function(content){
+    let a = document.createElement('a'); 
+    a.href = URL.createObjectURL(content); 
+    a.download = 'percorso.kmz'; 
+    a.click();
+    alert(`File KMZ generato: ${state.points.length} punti, ${content.size} byte`);
+  });
+}
+
+function exportGPX(){
+  if(state.points.length===0){ alert("Nessun punto da esportare."); return; }
+  let gpx = '<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Percorso</name><trkseg>';
+  gpx += state.points.map(p => `<trkpt lat="${p.lat}" lon="${p.lon}"><ele>${p.ele}</ele></trkpt>`).join('');
+  gpx += '</trkseg></trk>';
+  state.notes.forEach(n => {
+    gpx += `<wpt lat="${n.lat}" lon="${n.lon}"><name>Nota</name><desc>${n.text}</desc></wpt>`;
+  });
+  gpx += '</gpx>';
+  let blob = new Blob([gpx], {type:'application/gpx+xml'});
+  let a = document.createElement('a'); 
+  a.href = URL.createObjectURL(blob); 
+  a.download = 'percorso.gpx'; 
+  a.click();
+  alert(`File GPX generato: ${state.points.length} punti, ${blob.size} byte`);
+}
+
+document.getElementById('startBtn').addEventListener('click', startTracking);
+document.getElementById('stopBtn').addEventListener('click', stopTracking);
+document.getElementById('noteBtn').addEventListener('click', addNote);
+document.getElementById('exportKML').addEventListener('click', exportKML);
+document.getElementById('exportKMZ').addEventListener('click', exportKMZ);
+document.getElementById('exportGPX').addEventListener('click', exportGPX);
+document.getElementById('grantBtn').addEventListener('click', ()=>{
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(()=>{
+      if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+        DeviceOrientationEvent.requestPermission().catch(()=>{});
+      }
+      document.getElementById('modal').style.display='none';
+    }, (err)=>{
+      if(err.code===1){
+        document.getElementById('modalError').textContent="Permesso GPS negato."; 
+        document.getElementById('modalError').classList.remove('hidden');
+      } else { 
+        document.getElementById('modal').style.display='none'; 
+      }
+    }, {enableHighAccuracy:true, timeout:5000});
+  } else { 
+    document.getElementById('modalError').textContent="Geolocalizzazione non supportata."; 
+    document.getElementById('modalError').classList.remove('hidden'); 
+  }
+});
+
+window.onload = initMap;
+</script>
+</body>
+</html>
